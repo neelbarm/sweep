@@ -1,0 +1,29 @@
+[package]
+name = "sweep"
+version = "0.1.0"
+edition = "2021"
+description = "Find and reclaim stale dev caches (node_modules, target/, .venv, ...) with a TUI"
+license = "MIT"
+authors = ["Neel Barmecha"]
+repository = "https://github.com/neelbarmecha/sweep"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+crossterm = "0.28"
+dirs = "5"
+rayon = "1"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+trash = "5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -104,9 +104,52 @@ fn skip_prefixes() -> Vec<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         v.push(home.join("Library"));
         v.push(home.join(".Trash"));
+        for d in TOOL_DIRS {
+            v.push(home.join(d));
+        }
     }
     v
 }
+
+/// Home directories owned by a *tool*, not by the user's projects.
+///
+/// They are full of directories that match the rules perfectly — a VS Code
+/// extension really does ship a `node_modules` next to a `package.json` — but
+/// deleting them breaks an installed program rather than freeing regenerable
+/// build output. `sweep` reports what `npm install` and `cargo build` can put
+/// back, so it stays out of here. Point sweep at one explicitly and it will
+/// still look: an explicit root always wins over this list.
+pub const TOOL_DIRS: &[&str] = &[
+    ".npm",
+    ".nvm",
+    ".bun",
+    ".deno",
+    ".yarn",
+    ".pnpm-store",
+    ".cache",
+    ".cargo",
+    ".rustup",
+    ".rbenv",
+    ".pyenv",
+    ".gem",
+    ".m2",
+    ".gradle",
+    ".android",
+    ".docker",
+    ".ollama",
+    ".vscode",
+    ".vscode-insiders",
+    ".vscode-server",
+    ".cursor",
+    ".windsurf",
+    ".zed",
+    ".codex",
+    ".claude",
+    ".oh-my-zsh",
+    ".local/share",
+    ".local/lib",
+    "Applications",
+];
 
 /// Directory names that never contain a project and cost a lot to walk.
 fn skip_dir_name(name: &str) -> bool {
@@ -463,13 +506,19 @@ pub fn project_last_used(root: &Path) -> Option<i64> {
         }
     }
 
-    // Guard against clock skew / files dated in the future.
+    // Guard against clock skew, and against archive sentinel dates: npm and
+    // many package tarballs stamp every file with 1985-10-26 or the unix
+    // epoch, which would otherwise report a freshly installed dependency tree
+    // as "40 y ago". A project we cannot honestly date reports `unknown`.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(i64::MAX);
-    newest.map(|t| t.min(now))
+    newest.map(|t| t.min(now)).filter(|t| *t >= SENTINEL_FLOOR)
 }
+
+/// Timestamps before 2000-01-01 are archive sentinels, not evidence of use.
+const SENTINEL_FLOOR: i64 = 946_684_800;
 
 /// Sort orders shared by the TUI and the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,11 +591,11 @@ impl Filter {
             }
         }
         if let Some(days) = self.older_than_days {
+            // An unknown age fails the filter. "I could not date this
+            // project" must never be presented as "nobody has touched it in a
+            // year".
             match hit.age_days() {
                 Some(a) if a >= days => {}
-                // Unknown age is treated as stale: nothing in the project
-                // reported an mtime, which means nothing is using it.
-                None => {}
                 _ => return false,
             }
         }
@@ -701,6 +750,66 @@ mod tests {
         write(&proj.join(".git/HEAD"), 40);
         let t = project_last_used(&proj);
         assert!(t.is_some(), "the .git/HEAD mtime should date the project");
+    }
+
+    #[test]
+    fn archive_sentinel_dates_are_not_evidence_of_use() {
+        let td = TempDir::new().unwrap();
+        let proj = td.path().join("pkg");
+        write(&proj.join("package.json"), 10);
+        // npm and many tarballs stamp every extracted file with 1985-10-26.
+        let ok = std::process::Command::new("touch")
+            .args(["-t", "198510260000"])
+            .arg(proj.join("package.json"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return; // no `touch` available; nothing to assert
+        }
+        assert_eq!(
+            project_last_used(&proj),
+            None,
+            "a 1985 timestamp must read as unknown, not as '40 y ago'"
+        );
+
+        // A single real file in the same project restores a usable date.
+        write(&proj.join("index.js"), 10);
+        assert!(project_last_used(&proj).is_some());
+    }
+
+    #[test]
+    fn an_unknown_age_never_satisfies_older_than() {
+        let hit = Hit {
+            path: PathBuf::from("/tmp/x/node_modules"),
+            kind: "node_modules".to_string(),
+            size_bytes: 1024,
+            file_count: 1,
+            last_used: None,
+            project_root: PathBuf::from("/tmp/x"),
+        };
+        let f = Filter {
+            older_than_days: Some(90),
+            ..Default::default()
+        };
+        assert!(!f.matches(&hit), "undatable projects must not look stale");
+        // With no age filter it is still reported.
+        assert!(Filter::default().matches(&hit));
+    }
+
+    #[test]
+    fn tool_installs_are_pruned_but_an_explicit_root_wins() {
+        let Some(home) = dirs::home_dir() else { return };
+        let skips = skip_prefixes();
+        for d in [".npm", ".vscode", ".cargo", ".local/share"] {
+            assert!(
+                skips.contains(&home.join(d)),
+                "{d} should be pruned by default"
+            );
+        }
+        assert!(skips.contains(&home.join("Library")));
+        // Every tool dir is home-relative, never absolute.
+        assert!(TOOL_DIRS.iter().all(|d| !d.starts_with('/')));
     }
 
     #[test]

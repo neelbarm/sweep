@@ -2,7 +2,7 @@
 
 **Find the tens of gigabytes of build caches hiding on your dev machine, and reclaim them safely.**
 
-![sweep](docs/demo.gif)
+![sweep](docs/demo.png)
 
 ## Why
 

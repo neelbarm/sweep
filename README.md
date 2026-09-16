@@ -63,7 +63,7 @@ either way.
 ## 60-second quickstart
 
 ```bash
-git clone https://github.com/neelbarmecha/sweep && cd sweep
+git clone https://github.com/neelbarm/sweep && cd sweep
 cargo install --path .        # or: cargo build --release
 
 sweep                         # interactive TUI over your home directory

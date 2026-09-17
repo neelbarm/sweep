@@ -1,4 +1,5 @@
-FIXTURE := /private/tmp/claude-501/-Users-neelbarmecha-LINKEDIN-PROJECTS/bc69f789-0768-424f-9c98-50960cd19268/scratchpad/sweep-fixture
+# Override with `make demo FIXTURE=/somewhere/else`.
+FIXTURE ?= /tmp/sweep-fixture
 CARGO_JOBS := -j 4
 
 .PHONY: build release test fmt clippy check fixture demo demo-tui scan install clean-fixture

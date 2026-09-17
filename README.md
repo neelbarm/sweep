@@ -23,40 +23,42 @@ A read-only scan of a working developer's home directory, on a 10-core M-series 
 
 ```
 $ sweep scan ~
-  cargo_target      7.41 GiB   (2 dirs)
-  node_modules      7.37 GiB   (69 dirs)
-  venv              2.38 GiB   (5 dirs)
-  js_cache          1.22 GiB   (7 dirs)
-  pycache           0.03 GiB   (130 dirs)
-  js_build          0.02 GiB   (12 dirs)
+  cargo_target  ████████████████████████    7.4 GB (2)
+  node_modules  ███████████████████████▉    7.4 GB (69)
+  venv          ███████▊················    2.4 GB (5)
+  js_cache      ████····················    1.2 GB (7)
+  pycache       ▏·······················   30.7 MB (130)
+  js_build      ▏·······················   20.5 MB (12)
 
-  Reclaimable 18.44 GiB across 226 dirs / 705,497 files
-  · scanned 10,226 dirs in 3.9s
+  Reclaimable 18.4 GB across 226 dirs / 705,497 files · scanned 10,226 dirs in 3.9s
 ```
+
+Sizes are base-1024 with the familiar `KB`/`MB`/`GB` labels — `7.4 GB` here is
+7.4 GiB, the same number `du --apparent-size -h` prints.
 
 Eighteen gigabytes and seven hundred thousand files, from **10,226 directory reads** — because
 the walk stops at every match instead of descending into all 705,497 files. The five biggest:
 
 | size | files | kind | path |
 | --- | --- | --- | --- |
-| 6.56 GiB | 15,976 | `cargo_target` | `~/projects/mixpilot/apps/desktop/src-tauri/target` |
-| 1.12 GiB | 28,795 | `venv` | `~/Desktop/work/Jobs/ugc-edit/.venv` |
-| 1.02 GiB | 101,901 | `node_modules` | `~/Desktop/work/Signalnetiflymudita/node_modules` |
-| 0.85 GiB | 7,955 | `cargo_target` | `~/LINKEDIN PROJECTS/sweep/target` |
-| 0.78 GiB | 91,275 | `node_modules` | `~/.hermes/hermes-agent/node_modules` |
+| 6.6 GB | 15,976 | `cargo_target` | `~/projects/mixpilot/apps/desktop/src-tauri/target` |
+| 1.1 GB | 28,795 | `venv` | `~/Desktop/work/Jobs/ugc-edit/.venv` |
+| 1.0 GB | 101,901 | `node_modules` | `~/Desktop/work/Signalnetiflymudita/node_modules` |
+| 870 MB | 7,955 | `cargo_target` | `~/LINKEDIN PROJECTS/sweep/target` |
+| 799 MB | 91,275 | `node_modules` | `~/.hermes/hermes-agent/node_modules` |
 
 Two notes on those numbers, because both were bugs before they were features.
 
 **Tool installs are not your build output.** A VS Code extension really does ship a
 `node_modules` next to a `package.json`, and `~/.npm/_npx` really does look like a project.
-Counting them added 1.7 GiB and 513 rows to the total and would have told you to delete parts
+Counting them added 1.7 GB and 513 rows to the total and would have told you to delete parts
 of your own toolchain. `sweep` skips `~/.npm`, `~/.cache`, `~/.cargo`, `~/.rustup`, `~/.vscode`,
 `~/.local/share`, `~/Applications` and a dozen more, unless you point it at one explicitly.
 
 **Apparent size, not blocks.** Spot-checking the three largest hits against `du` reproduced
 `sweep`'s file counts and byte totals exactly, while `du` — which counts allocated blocks —
-reported 4.3 GB for the 6.56 GiB Rust `target` (APFS clones and compression) and 1.3 GB for
-the 1.02 GiB `node_modules`, where 101,901 tiny files each round up to a 4 KB block. Apparent
+reported 4.3 GB for the 6.6 GB Rust `target` (APFS clones and compression) and 1.3 GB for
+the 1.0 GB `node_modules`, where 101,901 tiny files each round up to a 4 KB block. Apparent
 size is the honest answer to "how much is in here"; what the disk gives back can differ
 either way.
 
@@ -80,6 +82,9 @@ sweep scan ~ --older-than 90d # non-interactive report, never deletes
 make demo        # builds a throwaway tree of 13 fake projects, then scans it
 make demo-tui    # the same fixture in the interactive UI
 ```
+
+The fixture is built in `/tmp/sweep-fixture`; override it with
+`make demo FIXTURE=/somewhere/else`, and `make clean-fixture` removes it.
 
 The fixture deliberately includes five **decoys** — a `target/` with no `Cargo.toml`, a
 checked-in `dist/`, a config directory named `env/`, an orphan `node_modules`, and a symlink
@@ -111,7 +116,8 @@ pointing at a real artifact. None of them are ever reported. That is the whole d
 | `f` | cycle the kind filter through the kinds actually found |
 | `o` | cycle the age filter: any → 30d+ → 90d+ → 180d+ |
 | `enter` | details: the artifact's top-level contents by size |
-| `d` | delete the selection (confirmation modal first) |
+| `d` | delete the selection — opens the confirmation modal |
+| `y` / `n` | in that modal only: confirm / cancel. Nothing else confirms |
 | `q` | quit |
 
 Totals ease toward their new values as results stream in, newly discovered rows flash once,
@@ -198,21 +204,26 @@ rather than "40 y ago". And a project `sweep` cannot date never satisfies `--old
 
 ### 4. Trash-first safety
 
-Deletion is opt-in at three separate points: you select rows, you press `d`, and you confirm.
+Deletion is opt-in at three separate points: you select rows, you press `d`, and you
+confirm with `y`. `y` is the only key that confirms — `d` itself never does, so a
+double-tap or a held key cannot delete anything you have not read.
 `clean` needs `--yes`. And by default nothing is destroyed — artifacts go to the macOS Trash
 via the `trash` crate, so recovery is a right-click away. `--permanent` switches to
 `remove_dir_all`, and the confirmation modal turns red and says so.
 
-Before any path is removed, it must pass all five checks — **re-evaluated at deletion time**,
-not trusted from the scan, because a scan of a home directory can be minutes old by the time
-a human presses the key:
+Only paths the scan produced are ever offered for deletion, and before any one of them is
+removed it must pass all six checks — **re-evaluated against the filesystem at deletion
+time**, not trusted from the scan, because a scan of a home directory can be minutes old by
+the time a human presses the key:
 
-1. it was produced by the scan running in this process;
+1. it is not `/`, not `$HOME`, not a top-level directory, and not `~/Desktop`, `~/Documents`,
+   `~/Downloads`, `~/Library`, `~/Movies`, `~/Music`, `~/Pictures`, `~/Public`,
+   `~/Applications`;
 2. it is inside one of the roots you gave, and is not a root itself;
-3. it is not `/`, not `$HOME`, not a top-level directory, and not `~/Desktop`, `~/Documents`,
-   `~/Downloads`, `~/Library`, `~/Movies`, `~/Music`, `~/Pictures`, `~/Public`;
-4. it is a real directory, not a symlink;
-5. its **marker is still there** — if the `Cargo.toml` next to a `target/` has vanished since
+3. it still exists;
+4. it is not a symlink;
+5. it is a directory;
+6. its **marker is still there** — if the `Cargo.toml` next to a `target/` has vanished since
    the scan, the deletion is refused.
 
 Every attempt, including refusals and failures, is appended to `~/.sweep/history.jsonl`:
@@ -222,7 +233,9 @@ Every attempt, including refusals and failures, is appended to `~/.sweep/history
  "size_bytes":18874368,"file_count":6,"mode":"trash","ok":true}
 ```
 
-Set `SWEEP_HISTORY` to send that log somewhere else.
+Set `SWEEP_HISTORY` to send that log somewhere else. If the log cannot be written at all,
+`sweep` says so before it deletes anything — on stderr for the CLI, in the status line for
+the TUI — rather than reclaiming space with no record of it.
 
 ## CLI reference
 
@@ -233,7 +246,7 @@ sweep [ROOTS...]                 interactive TUI (default root: ~)
 
 sweep scan [ROOTS...]            print a report, never deletes
   --json                         machine-readable output
-  --kind node_modules,target     restrict to these kinds
+  --kind node_modules,cargo_target   restrict to these kinds (see `sweep rules`)
   --older-than 90d               only projects idle this long (d/w/mo/y)
   --min-size 50MB                only artifacts at least this big
   --sort size|age|kind|path      default: size
@@ -276,7 +289,7 @@ are portable, and the Trash backend comes from the cross-platform `trash` crate.
 ## Development
 
 ```bash
-make test      # 66 tests: rules, sizing, staleness, formatting, CLI, safety
+make test      # 75 tests: rules, sizing, staleness, formatting, CLI, safety
 make check     # fmt + clippy -D warnings + tests
 make fixture   # regenerate the demo tree
 ```

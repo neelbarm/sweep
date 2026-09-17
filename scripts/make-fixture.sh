@@ -7,7 +7,7 @@
 # decoys that look like artifacts but must NOT be matched.
 set -euo pipefail
 
-FIXTURE="${1:-/private/tmp/claude-501/-Users-neelbarmecha-LINKEDIN-PROJECTS/bc69f789-0768-424f-9c98-50960cd19268/scratchpad/sweep-fixture}"
+FIXTURE="${1:-/tmp/sweep-fixture}"
 
 rm -rf "$FIXTURE"
 mkdir -p "$FIXTURE"

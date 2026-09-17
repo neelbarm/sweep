@@ -1,6 +1,6 @@
 //! Deletion, with the safety fence and the audit log.
 //!
-//! Every removal has to pass the same five checks, whether it was triggered
+//! Every removal has to pass the same six checks, whether it was triggered
 //! from the TUI or from `sweep clean --yes`. The checks re-validate the path
 //! at the moment of deletion rather than trusting the scan result, because a
 //! scan of a large home directory can be minutes old by the time a human hits
@@ -147,7 +147,10 @@ pub fn check(path: &Path, roots: &[PathBuf]) -> Result<(), Refusal> {
 }
 
 /// Delete one artifact. Trash by default; `permanent` uses `remove_dir_all`.
-/// Always appends to the history log, including refusals and failures.
+///
+/// Appends to the history log, including refusals and failures. Logging is
+/// best-effort and never blocks a deletion; callers run [`history_preflight`]
+/// first so the user is told when the log cannot be written at all.
 pub fn delete_hit(hit: &Hit, roots: &[PathBuf], permanent: bool) -> Outcome {
     let outcome = match check(&hit.path, roots) {
         Err(r) => Outcome::Refused(r),
@@ -177,6 +180,30 @@ pub fn history_path() -> Option<PathBuf> {
         return Some(PathBuf::from(p));
     }
     dirs::home_dir().map(|h| h.join(".sweep/history.jsonl"))
+}
+
+/// Check up front that the audit log is writable, and describe the problem if
+/// it is not.
+///
+/// `delete_hit` deliberately never fails a deletion because the log could not
+/// be written — refusing to reclaim space because a log file is unwritable
+/// would be the wrong trade. But the user must be told, otherwise deletions
+/// happen with no record at all and nothing on screen says so. Both front ends
+/// call this once before a batch.
+pub fn history_preflight() -> Option<String> {
+    history_preflight_at(&history_path()?)
+}
+
+fn history_preflight_at(path: &Path) -> Option<String> {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            return Some(format!("cannot create {}: {e}", parent.display()));
+        }
+    }
+    match fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(_) => None,
+        Err(e) => Some(format!("cannot write {}: {e}", path.display())),
+    }
 }
 
 fn log_history(hit: &Hit, permanent: bool, outcome: &Outcome) -> std::io::Result<()> {
@@ -326,6 +353,27 @@ mod tests {
             .expect("the deletion is audited");
         assert!(line.contains("\"mode\":\"permanent\""), "{line}");
         assert!(line.contains("\"ok\":true"), "{line}");
+    }
+
+    /// Checked against an explicit path rather than `SWEEP_HISTORY`: the env
+    /// var is process-wide and the rest of the suite runs in parallel.
+    #[test]
+    fn history_preflight_reports_an_unwritable_log() {
+        let td = TempDir::new().unwrap();
+        // A *file* where the `.sweep` directory has to go: the log can never
+        // be created, and the user has to be told rather than losing the audit
+        // trail silently.
+        let blocked = td.path().join("blocked");
+        fs::write(&blocked, "not a directory").unwrap();
+        let problem = history_preflight_at(&blocked.join("history.jsonl"));
+        assert!(
+            problem.is_some(),
+            "an unwritable audit log must be reported, not swallowed"
+        );
+
+        // A writable location stays quiet, and creates the directory for it.
+        assert!(history_preflight_at(&td.path().join(".sweep/history.jsonl")).is_none());
+        assert!(td.path().join(".sweep").is_dir());
     }
 
     #[test]

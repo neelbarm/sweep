@@ -10,7 +10,9 @@ use crate::remove;
 use crate::rules;
 use crate::scan::{self, Filter, Hit, ScanOptions, ScanResult, SortKey};
 use crate::theme::{self, Swatch};
-use crate::util::{elide_middle, human_ago, human_bytes, human_count, shorten_home};
+use crate::util::{
+    elide_middle, human_ago, human_bytes, human_count, pad_left, pad_right, shorten_home,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -338,13 +340,15 @@ fn print_table(res: &ScanResult, hits: &[Hit], limit: usize) {
         return;
     }
 
+    // Padded first, painted afterwards: colour codes are invisible but would
+    // otherwise count toward `format!`'s width and skew the whole header.
     println!(
-        "  {:<14}{:<path_w$} {:>10} {:>8} {:>12}",
-        paint("KIND", theme::DIM, false),
-        paint("PATH", theme::DIM, false),
-        paint("SIZE", theme::DIM, false),
-        paint("FILES", theme::DIM, false),
-        paint("LAST USED", theme::DIM, false),
+        "  {}{} {} {} {}",
+        paint(&pad_right("KIND", 14), theme::DIM, false),
+        paint(&pad_right("PATH", path_w), theme::DIM, false),
+        paint(&pad_left("SIZE", 9), theme::DIM, false),
+        paint(&pad_left("FILES", 8), theme::DIM, false),
+        paint(&pad_left("LAST USED", 12), theme::DIM, false),
     );
     println!(
         "  {}",
@@ -367,30 +371,19 @@ fn print_table(res: &ScanResult, hits: &[Hit], limit: usize) {
         // field is padded first and painted afterwards.
         println!(
             "  {}{} {} {} {}",
+            paint(&pad_right(&elide_middle(&hit.kind, 13), 14), kind_sw, false),
             paint(
-                &format!("{:<14}", elide_middle(&hit.kind, 13)),
-                kind_sw,
-                false
-            ),
-            paint(
-                &format!(
-                    "{:<path_w$}",
-                    elide_middle(&shorten_home(&hit.path), path_w)
-                ),
+                &pad_right(&elide_middle(&shorten_home(&hit.path), path_w), path_w),
                 theme::TEXT,
                 false
             ),
+            paint(&pad_left(&human_bytes(hit.size_bytes), 9), size_sw, true),
             paint(
-                &format!("{:>9}", human_bytes(hit.size_bytes)),
-                size_sw,
-                true
-            ),
-            paint(
-                &format!("{:>8}", human_count(hit.file_count)),
+                &pad_left(&human_count(hit.file_count), 8),
                 theme::DIM,
                 false
             ),
-            paint(&format!("{:>12}", human_ago(hit.last_used)), age_sw, false),
+            paint(&pad_left(&human_ago(hit.last_used), 12), age_sw, false),
         );
     }
     if hits.len() > limit {
@@ -414,10 +407,10 @@ fn print_table(res: &ScanResult, hits: &[Hit], limit: usize) {
         let pad = bar_w.saturating_sub(filled.chars().count());
         println!(
             "  {}{}{} {} {}",
-            paint(&format!("{kind:<14}"), sw, false),
+            paint(&pad_right(kind, 14), sw, false),
             paint(&filled, sw, false),
             paint(&"·".repeat(pad), theme::FAINT, false),
-            paint(&format!("{:>9}", human_bytes(*bytes)), theme::TEXT, true),
+            paint(&pad_left(&human_bytes(*bytes), 9), theme::TEXT, true),
             paint(&format!("({count})"), theme::DIM, false),
         );
     }
@@ -528,6 +521,13 @@ fn clean(res: &ScanResult, hits: &[Hit], yes: bool, permanent: bool, json: bool)
             println!("{}", paint("nothing to reclaim", theme::DIM, false));
         }
         return Ok(0);
+    }
+
+    // Deleting without being able to record it is allowed, but never silent:
+    // the README promises every attempt is audited, so say so when it is not.
+    // Warnings go to stderr so `--json` stdout stays parseable.
+    if let Some(problem) = remove::history_preflight() {
+        eprintln!("sweep: warning: audit log unavailable ({problem}); these deletions will not be recorded");
     }
 
     let mut reclaimed = 0u64;

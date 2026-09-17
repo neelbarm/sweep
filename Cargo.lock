@@ -932,6 +932,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "trash",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]

@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Format a byte count the way a human reads it: `1.4 GB`, `812 MB`, `4.0 KB`.
 ///
@@ -97,28 +98,96 @@ pub fn shorten_home(path: &Path) -> String {
     s
 }
 
+/// Display columns a string occupies in a terminal.
+///
+/// Not the same as `chars().count()`: CJK, kana, Hangul and most emoji are
+/// double-width, so a path with them in it overflows a cell budgeted by
+/// character count and pushes every column after it out of alignment.
+pub fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Left-align `s` in `width` display columns.
+///
+/// `format!("{:<w$}")` pads by character count, which misaligns every column
+/// after a cell containing double-width characters.
+pub fn pad_right(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    let mut out = String::with_capacity(s.len() + width);
+    out.push_str(s);
+    for _ in w..width {
+        out.push(' ');
+    }
+    out
+}
+
+/// Right-align `s` in `width` display columns.
+pub fn pad_left(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    let mut out = String::with_capacity(s.len() + width);
+    for _ in w..width {
+        out.push(' ');
+    }
+    out.push_str(s);
+    out
+}
+
 /// Middle-elide a string to `width` display columns, keeping the head and the
 /// tail (the tail is what identifies an artifact, the head names the project).
+///
+/// The budget is in *columns*, not characters, so a path containing CJK or
+/// emoji still lands inside its cell. A double-width character is never split:
+/// when only one column is left, it is dropped and the result is one column
+/// narrower than the budget rather than one wider.
 pub fn elide_middle(s: &str, width: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= width {
+    if display_width(s) <= width {
         return s.to_string();
     }
-    if width <= 1 {
-        return "…".chars().take(width).collect();
+    if width == 0 {
+        return String::new();
     }
-    if width <= 4 {
-        let tail: String = chars[chars.len() - (width - 1)..].iter().collect();
-        return format!("…{tail}");
+    if width == 1 {
+        return "…".to_string();
     }
-    let keep = width - 1; // one column for the ellipsis
-    let head = keep / 3;
-    let tail = keep - head;
-    let mut out = String::with_capacity(width * 2);
-    out.extend(chars[..head].iter());
-    out.push('…');
-    out.extend(chars[chars.len() - tail..].iter());
-    out
+    // One column for the ellipsis; the rest is split head/tail as before.
+    let keep = width - 1;
+    let head_budget = if width <= 4 { 0 } else { keep / 3 };
+    let tail_budget = keep - head_budget;
+
+    let head = take_columns(s, head_budget, false);
+    let tail = take_columns(s, tail_budget, true);
+    format!("{head}…{tail}")
+}
+
+/// Take whole characters from one end of `s` while they fit in `budget`
+/// columns. `from_end` takes the tail instead of the head.
+fn take_columns(s: &str, budget: usize, from_end: bool) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    let mut used = 0usize;
+    let mut out: Vec<char> = Vec::new();
+    if from_end {
+        for c in s.chars().rev() {
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + w > budget {
+                break;
+            }
+            used += w;
+            out.push(c);
+        }
+        out.reverse();
+    } else {
+        for c in s.chars() {
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + w > budget {
+                break;
+            }
+            used += w;
+            out.push(c);
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Parse a human size string: `50MB`, `1.5g`, `900k`, `2048`.
@@ -222,8 +291,50 @@ mod tests {
         assert!(e.starts_with("~/proj"));
         // Degenerate widths must not panic and must respect the budget.
         for w in 0..8 {
-            assert!(elide_middle(p, w).chars().count() <= w.max(1));
+            assert!(display_width(&elide_middle(p, w)) <= w.max(1));
         }
+    }
+
+    #[test]
+    fn eliding_budgets_display_columns_not_characters() {
+        // CJK, kana and emoji are two columns wide. Budgeting by character
+        // count let a path overflow its cell and shove every column after it
+        // out of alignment.
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("日本語"), 6);
+        assert_eq!(display_width("🚀"), 2);
+
+        for s in [
+            "~/projects/日本語のプロジェクト名前が長い/node_modules",
+            "~/code/🚀🎉💾🔥emoji-project-🌟🌈/node_modules",
+            "~/混合mixed混合mixed混合/target",
+            "~/plain/ascii/path/node_modules",
+        ] {
+            for w in 0..60 {
+                let e = elide_middle(s, w);
+                assert!(
+                    display_width(&e) <= w.max(1),
+                    "{e:?} is {} columns, budget was {w}",
+                    display_width(&e)
+                );
+                // Never split a character: the result must still be valid text
+                // that round-trips through chars().
+                assert_eq!(e.chars().collect::<String>(), e);
+            }
+            assert_eq!(elide_middle(s, 500), s, "a wide budget leaves it alone");
+        }
+    }
+
+    #[test]
+    fn padding_counts_display_columns() {
+        assert_eq!(pad_right("abc", 6), "abc   ");
+        assert_eq!(pad_left("abc", 6), "   abc");
+        // Three CJK characters already fill six columns.
+        assert_eq!(display_width(&pad_right("日本語", 6)), 6);
+        assert_eq!(display_width(&pad_right("日本語", 10)), 10);
+        assert_eq!(display_width(&pad_left("🚀x", 8)), 8);
+        // Over-long input is never truncated by padding, only left as is.
+        assert_eq!(pad_right("abcdef", 3), "abcdef");
     }
 
     #[test]

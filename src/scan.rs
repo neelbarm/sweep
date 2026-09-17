@@ -189,6 +189,23 @@ pub fn normalize_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     kept
 }
 
+/// Must Xcode's DerivedData be walked as a root of its own?
+///
+/// Yes exactly when the user asked for somewhere that contains it but our own
+/// pruning would stop the walk getting there — which is the normal case, since
+/// `~/Library` is skipped wholesale and DerivedData lives inside it. Adding it
+/// as a root (rather than un-pruning `~/Library`) keeps the walk cheap.
+///
+/// This used to test "is DerivedData under some root?" on its own, which is
+/// true for *every* scan of `~` — so the extra root was never added and the
+/// `derived_data` rule could never fire from a plain `sweep ~`.
+fn needs_derived_data_root(roots: &[PathBuf], dd: &Path, skip: &[PathBuf]) -> bool {
+    let asked_for = roots.iter().any(|r| dd.starts_with(r));
+    let pruned = skip.iter().any(|p| dd.starts_with(p));
+    let already_a_root = roots.iter().any(|r| r.starts_with(dd));
+    asked_for && pruned && !already_a_root
+}
+
 struct Ctx {
     max_depth: Option<usize>,
     skip: Vec<PathBuf>,
@@ -234,26 +251,22 @@ pub fn scan(opts: &ScanOptions, tx: Option<Sender<Event>>) -> ScanResult {
     let mut roots = normalize_roots(&opts.roots);
 
     let derived_root = rules::derived_data_root().filter(|p| p.is_dir());
-    if opts.include_derived_data {
-        if let Some(dd) = &derived_root {
-            // ~/Library is pruned wholesale, so DerivedData joins as its own
-            // root whenever the user asked for a location that contains it.
-            let covered = roots.iter().any(|r| dd.starts_with(r));
-            let asked_home = dirs::home_dir()
-                .map(|h| roots.iter().any(|r| h.starts_with(r) || r == &h))
-                .unwrap_or(false);
-            if !covered && asked_home {
-                roots.push(dd.clone());
-            }
-        }
-    }
 
     // A skip prefix loses to an explicit request: if the user points sweep at
     // something inside `/private` or `~/Library`, that is what they meant.
+    // Computed from the roots the *user* gave, before DerivedData is appended.
     let skip: Vec<PathBuf> = skip_prefixes()
         .into_iter()
         .filter(|p| !roots.iter().any(|r| r.starts_with(p)))
         .collect();
+
+    if opts.include_derived_data {
+        if let Some(dd) = &derived_root {
+            if needs_derived_data_root(&roots, dd, &skip) {
+                roots.push(dd.clone());
+            }
+        }
+    }
 
     let ctx = Ctx {
         max_depth: opts.max_depth,
@@ -369,14 +382,43 @@ fn measure(path: PathBuf, kind: &'static str, ctx: &Ctx) {
     }
 }
 
-/// Recursive apparent size of a directory: the sum of file lengths, with
-/// sub-directories fanned out across the rayon pool. Symlinks are never
+/// Apparent size of a directory: the sum of file lengths. Symlinks are never
 /// followed, so a symlinked cache is never double-counted.
+///
+/// The traversal is breadth-first over an explicit worklist — one level at a
+/// time, fanned across the rayon pool — rather than recursive. Recursing here
+/// used to overflow the worker stack and abort the whole process on deeply
+/// nested trees (a few hundred levels is enough, and npm used to nest that
+/// far). An explicit worklist makes the depth a heap cost instead.
 pub fn dir_size(path: &Path) -> (u64, u64) {
     let mut bytes = 0u64;
     let mut files = 0u64;
+    let mut level: Vec<PathBuf> = vec![path.to_path_buf()];
+
+    while !level.is_empty() {
+        let (b, f, next) = level.par_iter().map(|dir| shallow_size(dir)).reduce(
+            || (0u64, 0u64, Vec::new()),
+            |mut a, b| {
+                a.0 = a.0.saturating_add(b.0);
+                a.1 = a.1.saturating_add(b.1);
+                a.2.extend(b.2);
+                a
+            },
+        );
+        bytes = bytes.saturating_add(b);
+        files = files.saturating_add(f);
+        level = next;
+    }
+    (bytes, files)
+}
+
+/// One directory, no recursion: its own file bytes/count plus the
+/// sub-directories still to visit.
+fn shallow_size(dir: &Path) -> (u64, u64, Vec<PathBuf>) {
+    let mut bytes = 0u64;
+    let mut files = 0u64;
     let mut subdirs: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = fs::read_dir(path) {
+    if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let Ok(ft) = entry.file_type() else { continue };
             if ft.is_symlink() {
@@ -386,20 +428,13 @@ pub fn dir_size(path: &Path) -> (u64, u64) {
                 subdirs.push(entry.path());
             } else if ft.is_file() {
                 if let Ok(md) = entry.metadata() {
-                    bytes += md.len();
-                    files += 1;
+                    bytes = bytes.saturating_add(md.len());
+                    files = files.saturating_add(1);
                 }
             }
         }
     }
-    if subdirs.is_empty() {
-        return (bytes, files);
-    }
-    let (sb, sf) = subdirs
-        .par_iter()
-        .map(|p| dir_size(p))
-        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-    (bytes + sb, files + sf)
+    (bytes, files, subdirs)
 }
 
 /// Top-level contents of a directory by size, for the TUI detail view.
@@ -648,6 +683,69 @@ mod tests {
         let (bytes, files) = dir_size(td.path());
         assert_eq!(bytes, 6000);
         assert_eq!(files, 3);
+    }
+
+    #[test]
+    fn dir_size_survives_a_deeply_nested_tree() {
+        // Regression: `dir_size` used to recurse, so a few hundred levels
+        // overflowed the rayon worker stack and aborted the whole process.
+        let td = TempDir::new().unwrap();
+        let mut p = td.path().to_path_buf();
+        let mut depth = 0;
+        while depth < 450 {
+            p.push("d");
+            if fs::create_dir(&p).is_err() {
+                p.pop();
+                break;
+            }
+            depth += 1;
+        }
+        assert!(
+            depth > 150,
+            "need a deep tree to exercise this, got {depth}"
+        );
+        fs::write(p.join("leaf.bin"), vec![b'x'; 1234]).unwrap();
+        let (bytes, files) = dir_size(td.path());
+        assert_eq!(bytes, 1234);
+        assert_eq!(files, 1);
+    }
+
+    #[test]
+    fn derived_data_joins_as_a_root_when_library_is_pruned() {
+        let home = PathBuf::from("/Users/someone");
+        let dd = home.join("Library/Developer/Xcode/DerivedData");
+        let library = home.join("Library");
+
+        let library_only = std::slice::from_ref(&library);
+
+        // Scanning `~`: `~/Library` is pruned, so DerivedData must be added.
+        // This is the case that silently never fired.
+        assert!(needs_derived_data_root(
+            std::slice::from_ref(&home),
+            &dd,
+            library_only
+        ));
+
+        // Pointed straight at DerivedData: nothing is pruned, no extra root.
+        assert!(!needs_derived_data_root(
+            std::slice::from_ref(&dd),
+            &dd,
+            &[]
+        ));
+
+        // Pointed inside it: already covered by a root at or below it.
+        assert!(!needs_derived_data_root(
+            &[dd.join("App-abc")],
+            &dd,
+            library_only
+        ));
+
+        // An unrelated root does not drag DerivedData in.
+        assert!(!needs_derived_data_root(
+            &[PathBuf::from("/Users/someone/projects")],
+            &dd,
+            library_only
+        ));
     }
 
     #[test]

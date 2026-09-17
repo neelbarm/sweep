@@ -4,6 +4,8 @@
 
 ![sweep](docs/demo.png)
 
+![sweep in motion](docs/demo.gif)
+
 ## Why
 
 Every machine that has ever run `npm install`, `cargo build`, `python -m venv` or Xcode is

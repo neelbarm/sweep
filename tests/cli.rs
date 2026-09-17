@@ -289,6 +289,136 @@ fn clean_never_leaves_the_given_roots() {
     );
 }
 
+/// A symlink *named* like an artifact must never be reported, and cleaning
+/// around it must not reach through it into the real directory.
+#[test]
+#[cfg(unix)]
+fn a_symlink_named_node_modules_is_never_followed_or_deleted_through() {
+    let td = TempDir::new().unwrap();
+    let r = td.path();
+    let hist = r.join("history.jsonl");
+
+    // Real source that the symlink points at.
+    write(&r.join("realsrc/precious.js"), 120);
+    // A project whose `node_modules` is a symlink to that source.
+    write(&r.join("app/package.json"), 20);
+    std::os::unix::fs::symlink(r.join("realsrc"), r.join("app/node_modules")).unwrap();
+
+    let v = scan_json(r, &[], &hist);
+    assert_eq!(
+        v["count"].as_u64().unwrap(),
+        0,
+        "a symlinked node_modules must not be reported, got {:?}",
+        kinds(&v)
+    );
+
+    let (_, stderr, ok) = run(
+        &["clean", r.to_str().unwrap(), "--yes", "--permanent"],
+        &hist,
+    );
+    assert!(ok, "{stderr}");
+    assert!(
+        r.join("realsrc/precious.js").is_file(),
+        "the real directory behind the symlink must survive"
+    );
+    assert!(
+        fs::symlink_metadata(r.join("app/node_modules"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink itself must be left alone"
+    );
+}
+
+/// A symlink *inside* an artifact that escapes it must not be measured and
+/// must not be followed when the artifact is removed.
+#[test]
+#[cfg(unix)]
+fn a_symlink_inside_an_artifact_is_not_followed_out_of_it() {
+    let td = TempDir::new().unwrap();
+    let r = td.path();
+    let hist = r.join("history.jsonl");
+
+    write(&r.join("src/keep.rs"), 4_000);
+    write(&r.join("app/package.json"), 20);
+    write(&r.join("app/node_modules/pkg/blob.bin"), 50_000);
+    std::os::unix::fs::symlink(r.join("src"), r.join("app/node_modules/escape")).unwrap();
+
+    let v = scan_json(r, &[], &hist);
+    let nm = v["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["kind"] == "node_modules")
+        .expect("the node_modules is found");
+    assert_eq!(
+        nm["size_bytes"].as_u64().unwrap(),
+        50_000,
+        "the escaping symlink's target must not be counted"
+    );
+    assert_eq!(nm["file_count"].as_u64().unwrap(), 1);
+
+    let (_, stderr, ok) = run(
+        &["clean", r.to_str().unwrap(), "--yes", "--permanent"],
+        &hist,
+    );
+    assert!(ok, "{stderr}");
+    assert!(!r.join("app/node_modules").exists(), "the artifact is gone");
+    assert!(
+        r.join("src/keep.rs").is_file(),
+        "deletion must remove the link, never what it points at"
+    );
+}
+
+/// The fence is re-evaluated at deletion time: a `Hit` from a scan whose
+/// marker has since vanished must be refused, and the refusal audited.
+#[test]
+fn a_marker_that_vanished_after_the_scan_refuses_the_delete() {
+    let td = TempDir::new().unwrap();
+    let r = td.path();
+    let hist = r.join("history.jsonl");
+    std::env::set_var("SWEEP_HISTORY", &hist);
+
+    write(&r.join("cli/Cargo.toml"), 20);
+    write(&r.join("cli/target/debug/bin"), 900_000);
+
+    let res = sweep::scan::scan(
+        &sweep::scan::ScanOptions {
+            roots: vec![r.to_path_buf()],
+            max_depth: None,
+            include_derived_data: false,
+        },
+        None,
+    );
+    let hit = res
+        .hits
+        .iter()
+        .find(|h| h.kind == "cargo_target")
+        .expect("the target is found")
+        .clone();
+
+    // The window between scan and keypress: the manifest goes away.
+    fs::remove_file(r.join("cli/Cargo.toml")).unwrap();
+
+    let outcome = sweep::remove::delete_hit(&hit, &res.roots, true);
+    assert!(!outcome.is_ok(), "{}", outcome.describe());
+    assert!(
+        outcome.describe().contains("marker is gone"),
+        "{}",
+        outcome.describe()
+    );
+    assert!(
+        r.join("cli/target").is_dir(),
+        "a target with no manifest must survive"
+    );
+
+    let log = fs::read_to_string(&hist).unwrap();
+    assert!(
+        log.contains("\"ok\":false"),
+        "the refusal is audited: {log}"
+    );
+}
+
 #[test]
 fn rules_command_documents_every_marker() {
     let td = TempDir::new().unwrap();

@@ -429,8 +429,23 @@ fn pump_mode(app: &mut App) {
             }
             if finished.is_some() {
                 let gone: HashSet<PathBuf> = removed.iter().cloned().collect();
-                app.hits.retain(|h| !gone.contains(&h.path));
-                app.discovered.truncate(app.hits.len());
+                // `discovered` is indexed in lockstep with `hits`, so it has to
+                // be filtered by the same predicate. Truncating it instead left
+                // every surviving row pointing at another row's timestamp,
+                // which made already-seen rows flash as if just discovered.
+                let keep: Vec<bool> = app.hits.iter().map(|h| !gone.contains(&h.path)).collect();
+                let mut i = 0;
+                app.hits.retain(|_| {
+                    let k = keep[i];
+                    i += 1;
+                    k
+                });
+                let mut j = 0;
+                app.discovered.retain(|_| {
+                    let k = keep.get(j).copied().unwrap_or(true);
+                    j += 1;
+                    k
+                });
                 app.selected.clear();
                 app.pops.clear();
                 app.dirty = true;
@@ -496,8 +511,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 app.mode = Mode::Table;
             }
         }
+        // `y` is the only key that confirms, and it is the only key the modal
+        // offers. `d` must never confirm: `d` is what *opens* this modal, so
+        // accepting it here would let a double-tap — or one held key repeating —
+        // delete without the human ever reading what is about to go. `Enter` is
+        // excluded for the same reason: a stray buffered newline is not consent.
         Mode::Confirm { .. } => match key.code {
-            KeyCode::Char('y') | KeyCode::Enter | KeyCode::Char('d') => start_delete(app),
+            KeyCode::Char('y') => start_delete(app),
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
                 app.mode = Mode::Table;
                 app.note("cancelled", false);
@@ -572,6 +592,10 @@ fn open_details(app: &mut App) {
 }
 
 fn start_delete(app: &mut App) {
+    // Never delete without saying so when the deletion cannot be audited.
+    if let Some(problem) = remove::history_preflight() {
+        app.note(format!("audit log unavailable ({problem})"), true);
+    }
     let targets = app.selected_hits();
     let roots = app.roots.clone();
     let permanent = app.permanent;
@@ -1564,6 +1588,58 @@ mod tests {
         assert_eq!(empty.cursor, 0);
         empty.toggle_selection();
         assert!(empty.selected.is_empty());
+    }
+
+    /// The confirmation modal is the last gate before data is destroyed, so
+    /// only the key it actually offers may pass it.
+    #[test]
+    fn only_y_confirms_a_delete() {
+        // Keep the audit log out of the developer's real home.
+        std::env::set_var(
+            "SWEEP_HISTORY",
+            std::env::temp_dir().join("sweep-test-history.jsonl"),
+        );
+        let mut app = app_with(vec![hit(
+            "node_modules",
+            900,
+            10,
+            "/tmp/sweep-does-not-exist/node_modules",
+        )]);
+        app.toggle_selection();
+
+        let press = |app: &mut App, code: KeyCode| handle_key(app, KeyEvent::from(code));
+
+        press(&mut app, KeyCode::Char('d'));
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "d opens the modal"
+        );
+
+        // `d` is the key that *opened* this modal. If it also confirmed, a
+        // double-tap — or one held key repeating — would delete without the
+        // human ever reading what is about to go.
+        press(&mut app, KeyCode::Char('d'));
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "a second d must not confirm the delete"
+        );
+
+        // A stray buffered newline is not consent either.
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "Enter must not confirm the delete"
+        );
+
+        press(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.mode, Mode::Table), "n cancels");
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(
+            matches!(app.mode, Mode::Deleting { .. }),
+            "y is the key that starts the delete"
+        );
     }
 
     #[test]
